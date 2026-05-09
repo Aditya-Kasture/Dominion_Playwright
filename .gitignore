@@ -1,0 +1,15 @@
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# AI tooling (internal only — not for users)
+.claude/
+.claude-flow/
+.swarm/
+.mcp.json
+CLAUDE.md
