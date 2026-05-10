@@ -16,34 +16,37 @@
 
 import { test, expect, Page, BrowserContext } from '@playwright/test';
 import * as dotenv from 'dotenv';
-import { fetchBGEAccounts, logBGERun, closePool, BGEAccount } from './helpers/db';
+import { fetchBGEAccounts, logBGERun, closePool, BGEAccount, validateEnv } from './helpers/db';
 import { fetchBGEOtp } from './helpers/emailOTP';
-import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot } from './helpers/utils';
+import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, getRandomUserAgent, detectBotBlock } from './helpers/utils';
 
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const MODE = (process.env.BGE_MODE ?? 'full') as 'audit' | 'paperless' | 'bills' | 'full';
+const VALID_MODES = ['audit', 'paperless', 'bills', 'full'] as const;
+type Mode = typeof VALID_MODES[number];
+const rawMode = process.env.BGE_MODE ?? 'full';
+if (!VALID_MODES.includes(rawMode as Mode)) throw new Error(`Invalid BGE_MODE: "${rawMode}". Must be: ${VALID_MODES.join(', ')}`);
+const MODE = rawMode as Mode;
 const LOGIN_URL = process.env.BGE_LOGIN_URL ?? 'https://myaccount.bge.com/sign-in';
-const BGE_EMAIL = process.env.BGE_EMAIL ?? 'construction@thedominiongroup.com';
+const BGE_EMAIL = process.env.BGE_EMAIL ?? '';
 const BGE_PASSWORD = process.env.BGE_PASSWORD ?? '';
 const IMAP_HOST = process.env.IMAP_HOST ?? 'imap.gmail.com';
 const IMAP_PORT = Number(process.env.IMAP_PORT ?? 993);
 const IMAP_EMAIL = process.env.IMAP_EMAIL ?? BGE_EMAIL;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD ?? '';
 
-// Shared across all tests in this file — set by 'BGE Login' test
 let context: BrowserContext;
 let page: Page;
 let accounts: BGEAccount[] = [];
+let loginSucceeded = false;
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
 test.beforeAll(async ({ browser }) => {
+  validateEnv(['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'BGE_EMAIL', 'BGE_PASSWORD', 'IMAP_HOST', 'IMAP_EMAIL', 'IMAP_PASSWORD']);
   context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    userAgent: getRandomUserAgent(),
     viewport: { width: 1280, height: 800 },
   });
   page = await context.newPage();
@@ -123,17 +126,26 @@ test('BGE Login (email + password + OTP)', async () => {
     throw new Error(`BGE login failed — still on login page: ${url}`);
   }
 
+  loginSucceeded = true;
   console.log('[BGE] Login successful.');
 
   if (MODE === 'audit') {
     console.log('[BGE] AUDIT MODE — capturing homepage screenshot. No further actions.');
     await screenshot(page, 'bge_audit_home');
+    const botRisk = await detectBotBlock(page);
+    if (botRisk.signals.length > 0) {
+      console.warn('[BGE] Bot/CAPTCHA risk signals detected:', botRisk.signals);
+      await screenshot(page, 'bge_audit_bot_risk');
+    } else {
+      console.log('[BGE] No bot detection signals observed.');
+    }
   }
 });
 
 // ─── Test 2: Paperless Enrollment ─────────────────────────────────────────────
 
 test('BGE Paperless Enrollment (all accounts)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
   if (MODE === 'audit' || MODE === 'bills') {
     test.skip(true, `Mode is ${MODE} — skipping paperless enrollment.`);
     return;
@@ -147,17 +159,19 @@ test('BGE Paperless Enrollment (all accounts)', async () => {
 
     const found = await navigateToAccount(page, acctNum);
     if (!found) {
-      await logBGERun({ bge_account_number: acctNum, property_id: propId, action: 'navigate', status: 'FAILED', notes: 'Account not found in portal' });
+      try { await logBGERun({ bge_account_number: acctNum, property_id: propId, action: 'navigate', status: 'FAILED', notes: 'Account not found in portal' }); } catch (e) { console.error(`[BGE] Log failed for ${acctNum}:`, e); }
       continue;
     }
 
     const ok = await enablePaperless(page, acctNum);
-    await logBGERun({
-      bge_account_number: acctNum,
-      property_id: propId,
-      action: 'paperless_enrollment',
-      status: ok ? 'SUCCESS' : 'FAILED',
-    });
+    try {
+      await logBGERun({
+        bge_account_number: acctNum,
+        property_id: propId,
+        action: 'paperless_enrollment',
+        status: ok ? 'SUCCESS' : 'FAILED',
+      });
+    } catch (e) { console.error(`[BGE] Log failed for ${acctNum}:`, e); }
 
     await randomDelay(2000, 1000);
   }
@@ -166,6 +180,7 @@ test('BGE Paperless Enrollment (all accounts)', async () => {
 // ─── Test 3: Bill Retrieval ───────────────────────────────────────────────────
 
 test('BGE Bill Retrieval (all accounts)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
   if (MODE === 'audit' || MODE === 'paperless') {
     test.skip(true, `Mode is ${MODE} — skipping bill retrieval.`);
     return;
@@ -179,19 +194,21 @@ test('BGE Bill Retrieval (all accounts)', async () => {
 
     const found = await navigateToAccount(page, acctNum);
     if (!found) {
-      await logBGERun({ bge_account_number: acctNum, property_id: propId, action: 'navigate', status: 'FAILED', notes: 'Account not found in portal' });
+      try { await logBGERun({ bge_account_number: acctNum, property_id: propId, action: 'navigate', status: 'FAILED', notes: 'Account not found in portal' }); } catch (e) { console.error(`[BGE] Log failed for ${acctNum}:`, e); }
       continue;
     }
 
     const bill = await retrieveBill(page, acctNum);
-    await logBGERun({
-      bge_account_number: acctNum,
-      property_id: propId,
-      action: 'bill_retrieval',
-      status: bill.amount !== null ? 'SUCCESS' : 'PARTIAL',
-      bill_amount: bill.amount,
-      due_date: bill.dueDate,
-    });
+    try {
+      await logBGERun({
+        bge_account_number: acctNum,
+        property_id: propId,
+        action: 'bill_retrieval',
+        status: bill.amount !== null ? 'SUCCESS' : 'PARTIAL',
+        bill_amount: bill.amount,
+        due_date: bill.dueDate,
+      });
+    } catch (e) { console.error(`[BGE] Log failed for ${acctNum}:`, e); }
 
     await randomDelay(2000, 1000);
   }

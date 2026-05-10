@@ -1,18 +1,19 @@
 /**
  * QuickBooks Company File CSV mapper.
  *
- * Usage:
+ * Usage (single file):
  *   npx tsx scripts/import-quickbooks.ts --file export.csv [--output mapped.csv]
  *
+ * Usage (batch — all 12 QB Desktop company files at once):
+ *   npx tsx scripts/import-quickbooks.ts --dir ./qb-exports [--output ./mapped]
+ *
  * What it does:
- *   1. Reads a QuickBooks CSV export (any version — IIF / Company File / Transaction List)
+ *   1. Reads one or more QuickBooks CSV exports (any version — IIF / Company File / Transaction List)
  *   2. Auto-detects QB column names and maps them to Dominion's internal schema
  *   3. Prints a field-mapping report for Jack to confirm
- *   4. Optionally writes a normalized CSV to --output for downstream processing
- *
- * QuickBooks exports vary by version. Supported QB column aliases are listed in
- * FIELD_MAP below. If a field shows "✗ NOT FOUND" in the report, identify the
- * correct QB column name and add it to the alias list.
+ *   4. In --dir mode, prints a cross-file schema consistency report so gaps
+ *      across the 12 company files can be found before the pipeline is designed
+ *   5. Optionally writes normalized CSV(s) for downstream DB import
  *
  * Exit codes: 0 = success, 1 = fatal error
  */
@@ -27,20 +28,20 @@ dotenv.config();
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
 const fileIdx  = process.argv.indexOf('--file');
+const dirIdx   = process.argv.indexOf('--dir');
 const outIdx   = process.argv.indexOf('--output');
-const fileArg  = process.argv.find(a => a.startsWith('--file='))?.slice(7)
+
+const fileArg = process.argv.find(a => a.startsWith('--file='))?.slice(7)
   ?? (fileIdx !== -1 ? process.argv[fileIdx + 1] : undefined);
+const dirArg = process.argv.find(a => a.startsWith('--dir='))?.slice(6)
+  ?? (dirIdx !== -1 ? process.argv[dirIdx + 1] : undefined);
 const outputArg = process.argv.find(a => a.startsWith('--output='))?.slice(9)
   ?? (outIdx !== -1 ? process.argv[outIdx + 1] : undefined);
 
-if (!fileArg) {
-  console.error('Usage: npx tsx scripts/import-quickbooks.ts --file <export.csv> [--output <mapped.csv>]');
-  process.exit(1);
-}
-
-const csvPath = path.resolve(fileArg);
-if (!fs.existsSync(csvPath)) {
-  console.error(`File not found: ${csvPath}`);
+if (!fileArg && !dirArg) {
+  console.error('Usage:');
+  console.error('  Single file: npx tsx scripts/import-quickbooks.ts --file <export.csv> [--output <mapped.csv>]');
+  console.error('  Batch:       npx tsx scripts/import-quickbooks.ts --dir <folder>       [--output <out-folder>]');
   process.exit(1);
 }
 
@@ -124,12 +125,10 @@ function detectMapping(headers: string[]): Record<string, string | null> {
   for (const [field, candidates] of Object.entries(FIELD_MAP)) {
     detected[field] = null;
     for (const candidate of candidates) {
-      // Exact match first
       const idx = normHeaders.indexOf(norm(candidate));
       if (idx !== -1) { detected[field] = headers[idx]; break; }
     }
     if (!detected[field]) {
-      // Partial match fallback
       for (const candidate of candidates) {
         const idx = normHeaders.findIndex(h => h.includes(norm(candidate)));
         if (idx !== -1) { detected[field] = headers[idx]; break; }
@@ -157,8 +156,6 @@ async function parseCsv(filePath: string): Promise<{
 
   for await (const line of rl) {
     if (!line.trim()) { skippedLines++; continue; }
-
-    // QB IIF files start with !TRNS / TRNS / ENDTRNS — skip these markers
     if (line.startsWith('!') || line === 'ENDTRNS') { skippedLines++; continue; }
 
     lineNum++;
@@ -170,7 +167,6 @@ async function parseCsv(filePath: string): Promise<{
       continue;
     }
 
-    // Skip QB total/summary rows (first cell often blank or "TOTAL")
     if (!values[0] || values[0].toUpperCase().startsWith('TOTAL')) { skippedLines++; continue; }
 
     const row: Record<string, string> = {};
@@ -193,16 +189,17 @@ async function parseCsv(filePath: string): Promise<{
   return { headers, rows, mapping, skippedLines };
 }
 
-// ─── Report ───────────────────────────────────────────────────────────────────
+// ─── Per-file report ──────────────────────────────────────────────────────────
 
 function printReport(
+  filePath: string,
   headers: string[],
   mapping: Record<string, string | null>,
   rows: QBRow[],
   skippedLines: number
 ) {
   console.log('─── QuickBooks CSV Field Mapping Report ────────────────────────────────\n');
-  console.log(`  Source file:   ${csvPath}`);
+  console.log(`  Source file:   ${filePath}`);
   console.log(`  Total rows:    ${rows.length}`);
   console.log(`  Skipped lines: ${skippedLines}  (blanks, totals, IIF markers)\n`);
 
@@ -245,10 +242,61 @@ function printReport(
       console.log(`     · ${field}`);
       console.log(`       Expected QB column names: ${FIELD_MAP[field].slice(0, 4).join(', ')}, ...`);
     }
-    console.log('\n  → Send Jack this report. Ask him to identify which QB column');
-    console.log('    corresponds to each unmapped field, then re-run.');
   } else {
     console.log('\n  ✓  All fields mapped. Review sample rows, then run with --output to export.');
+  }
+}
+
+// ─── Cross-file schema consistency report ────────────────────────────────────
+
+function printSchemaReport(
+  fileNames: string[],
+  mappings: Record<string, string | null>[]
+) {
+  const fields = Object.keys(FIELD_MAP);
+  const colWidth = 22;
+  const fileColWidth = 12;
+
+  console.log('\n═══ Cross-File Schema Consistency Report ═══════════════════════════════\n');
+  console.log(`  Comparing ${fileNames.length} QB Desktop company files across ${fields.length} fields.\n`);
+
+  // Header row
+  const headerCols = fileNames.map(f => path.basename(f, '.csv').substring(0, fileColWidth - 1).padEnd(fileColWidth));
+  console.log('  ' + 'Field'.padEnd(colWidth) + '| ' + headerCols.join('| ') + '| Consistency');
+  console.log('  ' + '─'.repeat(colWidth) + '+' + fileNames.map(() => '─'.repeat(fileColWidth + 1)).join('+') + '+─────────────');
+
+  const gapFields: string[] = [];
+
+  for (const field of fields) {
+    const cells = mappings.map(m => m[field] !== null ? '✓' : '✗');
+    const mappedCount = cells.filter(c => c === '✓').length;
+    const consistency = mappedCount === fileNames.length
+      ? '✓ All files'
+      : mappedCount === 0
+        ? '✗ None'
+        : `⚠ ${mappedCount}/${fileNames.length}`;
+
+    if (mappedCount < fileNames.length) gapFields.push(field);
+
+    const cellCols = cells.map(c => c.padEnd(fileColWidth));
+    console.log('  ' + field.padEnd(colWidth) + '| ' + cellCols.join('| ') + '| ' + consistency);
+  }
+
+  console.log('  ' + '─'.repeat(colWidth) + '+' + fileNames.map(() => '─'.repeat(fileColWidth + 1)).join('+') + '+─────────────');
+
+  const fullyCovered = fields.length - gapFields.length;
+  console.log(`\n  Summary: ${fullyCovered}/${fields.length} fields consistent across all files.`);
+
+  if (gapFields.length > 0) {
+    console.log(`\n  ⚠  Fields with inconsistent coverage — must resolve before building the pipeline:`);
+    for (const f of gapFields) {
+      const covered = mappings.filter(m => m[f] !== null).length;
+      console.log(`     · ${f}  (found in ${covered}/${fileNames.length} files)`);
+    }
+    console.log('\n  → Send this report to Jack. Ask which column name each file uses for the missing fields,');
+    console.log('    then add those column aliases to FIELD_MAP in this script and re-run.');
+  } else {
+    console.log('\n  ✓  All fields mapped consistently across all files. Safe to build the pipeline schema.');
   }
 }
 
@@ -266,14 +314,62 @@ function writeMappedCsv(outputPath: string, rows: QBRow[]) {
   }
   fs.writeFileSync(outputPath, lines.join('\n'), 'utf8');
   console.log(`\n  Normalized CSV → ${outputPath}`);
-  console.log('  Share with Abdul for DB import once Jack confirms the field mapping.\n');
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Batch mode ───────────────────────────────────────────────────────────────
+
+async function runBatch(dirPath: string) {
+  const absDir = path.resolve(dirPath);
+  if (!fs.existsSync(absDir)) {
+    console.error(`Directory not found: ${absDir}`);
+    process.exit(1);
+  }
+
+  const csvFiles = fs.readdirSync(absDir)
+    .filter(f => f.toLowerCase().endsWith('.csv'))
+    .map(f => path.join(absDir, f))
+    .sort();
+
+  if (csvFiles.length === 0) {
+    console.warn(`No .csv files found in: ${absDir}`);
+    process.exit(0);
+  }
+
+  console.log(`Found ${csvFiles.length} CSV file(s) in: ${absDir}\n`);
+
+  const allMappings: Record<string, string | null>[] = [];
+
+  for (const csvPath of csvFiles) {
+    console.log(`\n${'═'.repeat(72)}`);
+    console.log(`  Processing: ${path.basename(csvPath)}`);
+    console.log('═'.repeat(72));
+
+    const { headers, rows, mapping, skippedLines } = await parseCsv(csvPath);
+    allMappings.push(mapping);
+    printReport(csvPath, headers, mapping, rows, skippedLines);
+
+    if (outputArg) {
+      fs.mkdirSync(path.resolve(outputArg), { recursive: true });
+      const outName = path.basename(csvPath, '.csv') + '_mapped.csv';
+      const outPath = path.join(path.resolve(outputArg), outName);
+      writeMappedCsv(outPath, rows);
+    }
+  }
+
+  printSchemaReport(csvFiles, allMappings);
+}
+
+// ─── Single-file mode ─────────────────────────────────────────────────────────
 
 async function run() {
+  const csvPath = path.resolve(fileArg!);
+  if (!fs.existsSync(csvPath)) {
+    console.error(`File not found: ${csvPath}`);
+    process.exit(1);
+  }
+
   const { headers, rows, mapping, skippedLines } = await parseCsv(csvPath);
-  printReport(headers, mapping, rows, skippedLines);
+  printReport(csvPath, headers, mapping, rows, skippedLines);
 
   if (outputArg) {
     writeMappedCsv(path.resolve(outputArg), rows);
@@ -285,7 +381,9 @@ async function run() {
   }
 }
 
-run().catch(err => {
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+(dirArg ? runBatch(dirArg) : run()).catch(err => {
   console.error('Fatal:', err);
   process.exit(1);
 });

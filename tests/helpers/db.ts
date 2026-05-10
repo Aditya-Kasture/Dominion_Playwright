@@ -31,6 +31,17 @@ export interface WaterAccount {
   baseline_period: string | null;
 }
 
+export function validateEnv(keys: string[]): void {
+  const missing = keys.filter(k => !process.env[k]);
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables:\n` +
+      missing.map(k => `  · ${k}`).join('\n') +
+      `\nCopy .env.example to .env and fill in the values.`
+    );
+  }
+}
+
 let pool: Pool | null = null;
 
 function getPool(): Pool {

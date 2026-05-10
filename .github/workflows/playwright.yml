@@ -1,13 +1,29 @@
-name: Playwright Tests
+name: Playwright Automation
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly — every Monday 8:00 AM UTC (Phase 1 decision: weekly not nightly)
+  workflow_dispatch:
 jobs:
   test:
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    env:
+      BGE_EMAIL: ${{ secrets.BGE_EMAIL }}
+      BGE_PASSWORD: ${{ secrets.BGE_PASSWORD }}
+      IMAP_HOST: ${{ secrets.IMAP_HOST }}
+      IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+      IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+      WATER_EMAIL: ${{ secrets.WATER_EMAIL }}
+      WATER_PASSWORD: ${{ secrets.WATER_PASSWORD }}
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_PORT: ${{ secrets.DB_PORT }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-node@v4
@@ -17,8 +33,14 @@ jobs:
       run: npm ci
     - name: Install Playwright Browsers
       run: npx playwright install --with-deps
-    - name: Run Playwright tests
+    - name: Run example tests
       run: npx playwright test tests/example.spec.ts
+    - name: Run portal automation (requires credentials)
+      if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      run: |
+        echo "Portal automation requires GitHub Secrets configured (BGE_EMAIL, BGE_PASSWORD, IMAP_EMAIL, IMAP_PASSWORD, WATER_EMAIL, WATER_PASSWORD, DB_HOST, DB_NAME, DB_USER, DB_PASSWORD)."
+        echo "Once secrets are added, replace this step with:"
+        echo "  BGE_MODE=full npx playwright test tests/bge.spec.ts tests/water.spec.ts --project=chromium"
     - uses: actions/upload-artifact@v4
       if: ${{ !cancelled() }}
       with:

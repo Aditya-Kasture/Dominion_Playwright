@@ -21,29 +21,33 @@
 
 import { test, Page, BrowserContext } from '@playwright/test';
 import * as dotenv from 'dotenv';
-import { fetchWaterAccounts, logWaterRun, closePool, WaterAccount } from './helpers/db';
-import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, determineWaterAction } from './helpers/utils';
+import { fetchWaterAccounts, logWaterRun, closePool, WaterAccount, validateEnv } from './helpers/db';
+import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, determineWaterAction, getRandomUserAgent, detectBotBlock } from './helpers/utils';
 
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const MODE = (process.env.WATER_MODE ?? 'full') as 'audit' | 'paperless' | 'bills' | 'full';
+const VALID_MODES = ['audit', 'paperless', 'bills', 'full'] as const;
+type Mode = typeof VALID_MODES[number];
+const rawMode = process.env.WATER_MODE ?? 'full';
+if (!VALID_MODES.includes(rawMode as Mode)) throw new Error(`Invalid WATER_MODE: "${rawMode}". Must be: ${VALID_MODES.join(', ')}`);
+const MODE = rawMode as Mode;
 // AUDIT NOTE: Confirm the exact login URL during the water portal audit
 const LOGIN_URL = process.env.WATER_LOGIN_URL ?? 'https://cityservices.baltimorecity.gov/water/Login';
-const WATER_EMAIL = process.env.WATER_EMAIL ?? 'construction@thedominiongroup.com';
+const WATER_EMAIL = process.env.WATER_EMAIL ?? '';
 const WATER_PASSWORD = process.env.WATER_PASSWORD ?? '';
 
 let context: BrowserContext;
 let page: Page;
 let units: WaterAccount[] = [];
+let loginSucceeded = false;
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
 test.beforeAll(async ({ browser }) => {
+  validateEnv(['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'WATER_EMAIL', 'WATER_PASSWORD']);
   context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    userAgent: getRandomUserAgent(),
     viewport: { width: 1280, height: 800 },
   });
   page = await context.newPage();
@@ -90,18 +94,27 @@ test('Water Portal Login', async () => {
     throw new Error(`Water portal login failed — still on login page: ${url}`);
   }
 
+  loginSucceeded = true;
   console.log('[Water] Login successful.');
   await screenshot(page, 'water_post_login');
 
   if (MODE === 'audit') {
     console.log('[Water] AUDIT MODE — capturing account overview screenshot.');
     await screenshot(page, 'water_audit_overview');
+    const botRisk = await detectBotBlock(page);
+    if (botRisk.signals.length > 0) {
+      console.warn('[Water] Bot/CAPTCHA risk signals detected:', botRisk.signals);
+      await screenshot(page, 'water_audit_bot_risk');
+    } else {
+      console.log('[Water] No bot detection signals observed.');
+    }
   }
 });
 
 // ─── Test 2: Paperless Enrollment ─────────────────────────────────────────────
 
 test('Water Paperless Enrollment (all units)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
   if (MODE === 'audit' || MODE === 'bills') {
     test.skip(true, `Mode is ${MODE} — skipping paperless enrollment.`);
     return;
@@ -115,17 +128,19 @@ test('Water Paperless Enrollment (all units)', async () => {
 
     const found = await navigateToUnit(page, unit);
     if (!found) {
-      await logWaterRun({ unit_id: unit.unit_id, property_id: unit.property_id, action: 'navigate', status: 'FAILED', notes: 'Address not found in portal' });
+      try { await logWaterRun({ unit_id: unit.unit_id, property_id: unit.property_id, action: 'navigate', status: 'FAILED', notes: 'Address not found in portal' }); } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
       continue;
     }
 
     const ok = await enableWaterPaperless(page, address);
-    await logWaterRun({
-      unit_id: unit.unit_id,
-      property_id: unit.property_id,
-      action: 'paperless_enrollment',
-      status: ok ? 'SUCCESS' : 'FAILED',
-    });
+    try {
+      await logWaterRun({
+        unit_id: unit.unit_id,
+        property_id: unit.property_id,
+        action: 'paperless_enrollment',
+        status: ok ? 'SUCCESS' : 'FAILED',
+      });
+    } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
 
     await randomDelay(2000, 1000);
   }
@@ -134,6 +149,7 @@ test('Water Paperless Enrollment (all units)', async () => {
 // ─── Test 3: Bill Retrieval + Threshold Logic ─────────────────────────────────
 
 test('Water Bill Retrieval (all units)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
   if (MODE === 'audit' || MODE === 'paperless') {
     test.skip(true, `Mode is ${MODE} — skipping bill retrieval.`);
     return;
@@ -147,7 +163,7 @@ test('Water Bill Retrieval (all units)', async () => {
 
     const found = await navigateToUnit(page, unit);
     if (!found) {
-      await logWaterRun({ unit_id: unit.unit_id, property_id: unit.property_id, action: 'navigate', status: 'FAILED', notes: 'Address not found in portal' });
+      try { await logWaterRun({ unit_id: unit.unit_id, property_id: unit.property_id, action: 'navigate', status: 'FAILED', notes: 'Address not found in portal' }); } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
       continue;
     }
 
@@ -158,17 +174,19 @@ test('Water Bill Retrieval (all units)', async () => {
       ? `Baseline: ${unit.consumption_baseline} units, Actual: ${bill.consumptionUnits} → ${thresholdAction}`
       : `No baseline on file — defaulting to auto_pay. Actual: ${bill.consumptionUnits}`;
 
-    await logWaterRun({
-      unit_id: unit.unit_id,
-      property_id: unit.property_id,
-      action: 'bill_retrieval',
-      status: bill.amount !== null ? 'SUCCESS' : 'PARTIAL',
-      bill_amount: bill.amount,
-      consumption_units: bill.consumptionUnits,
-      due_date: bill.dueDate,
-      threshold_action: thresholdAction,
-      notes,
-    });
+    try {
+      await logWaterRun({
+        unit_id: unit.unit_id,
+        property_id: unit.property_id,
+        action: 'bill_retrieval',
+        status: bill.amount !== null ? 'SUCCESS' : 'PARTIAL',
+        bill_amount: bill.amount,
+        consumption_units: bill.consumptionUnits,
+        due_date: bill.dueDate,
+        threshold_action: thresholdAction,
+        notes,
+      });
+    } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
 
     // Console alerts for elevated consumption — downstream can trigger PM notifications
     if (thresholdAction === 'pay_alert_pm') {
@@ -305,8 +323,15 @@ async function enableWaterPaperless(page: Page, address: string): Promise<boolea
       await page.waitForTimeout(1200);
     }
 
-    console.log(`[Water] Paperless enabled for ${address}.`);
-    return true;
+    const successEl = page.locator('.alert-success, [role="alert"]:has-text("paperless"), .success-message, .confirmation').first();
+    const confirmed = await successEl.isVisible({ timeout: 5_000 }).catch(() => false);
+    if (!confirmed) {
+      console.warn(`[Water] Paperless save confirmation not visible for ${address}.`);
+      await screenshot(page, 'water_paperless_unconfirmed');
+    } else {
+      console.log(`[Water] Paperless enabled for ${address}.`);
+    }
+    return confirmed;
   } catch (err) {
     console.error(`[Water] Error enabling paperless for ${address}:`, err);
     await screenshot(page, 'water_paperless_error');

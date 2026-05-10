@@ -1,4 +1,12 @@
 
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Screenshots (may contain authenticated portal pages with PII)
+screenshots/
+
 # Playwright
 node_modules/
 /test-results/
